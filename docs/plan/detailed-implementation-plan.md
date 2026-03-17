@@ -41,17 +41,12 @@
 
 ### Step 1-1: バックエンド — パッケージ追加
 
-```bash
-cd backend
-venv/Scripts/activate
-pip install python-jose[cryptography] passlib[bcrypt]
-pip freeze > requirements.txt
-```
+`backend/requirements.txt` に以下の2つのパッケージを追加して `pip install -r requirements.txt` を実行する。
 
 | パッケージ | 役割 |
 |-----------|------|
-| `python-jose` | JWTトークンの生成・検証 |
-| `passlib` | パスワードのハッシュ化（bcrypt） |
+| `python-jose[cryptography]` | JWTトークンの生成・検証 |
+| `passlib[bcrypt]` | パスワードのハッシュ化（bcrypt） |
 
 ---
 
@@ -59,91 +54,43 @@ pip freeze > requirements.txt
 
 **新規作成: `backend/app/security.py`**
 
-```python
-from __future__ import annotations
+以下の内容を実装する。
 
-import os
-from datetime import datetime, timedelta, timezone
+- `CryptContext` を使って bcrypt スキームのハッシュ化設定を行う
+- 環境変数 `SECRET_KEY` から秘密鍵を読み込む（未設定時はデフォルト値を使う）
+- `ALGORITHM = "HS256"` と `ACCESS_TOKEN_EXPIRE_MINUTES = 30` を定数として定義する
+- `hash_password(plain_password: str) -> str`
+  - 平文パスワードを bcrypt でハッシュ化して返す
+- `verify_password(plain_password: str, hashed_password: str) -> bool`
+  - 平文パスワードとハッシュを照合して True/False を返す
+- `create_access_token(data: dict) -> str`
+  - 引数の dict を**コピーして**（元の辞書を変更しない）有効期限 `exp` を追加し、JWTとしてエンコードして返す
+- `decode_token(token: str) -> dict`
+  - JWTトークンを検証・デコードして dict を返す。失敗時は `JWTError` を raise する
 
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-
-# パスワードハッシュ化の設定
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# JWT設定（本番では環境変数から読む）
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-
-
-def hash_password(plain_password: str) -> str:
-    """パスワードをbcryptでハッシュ化する"""
-    return pwd_context.hash(plain_password)
-
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """入力パスワードとハッシュを照合する"""
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-def create_access_token(data: dict) -> str:
-    """JWTトークンを生成する"""
-    payload = dict(data)  # コピーして元を変えない（イミュータブルの原則）
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    payload["exp"] = expire
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-
-
-def decode_token(token: str) -> dict:
-    """JWTトークンを検証・デコードする。失敗時は JWTError を raise する"""
-    return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-```
-
-> **なぜ `dict(data)` でコピーするの？**
-> 元の辞書を直接変更すると呼び出し元のデータが変わってしまうため。
-> 新しいオブジェクトを作ることで副作用を防ぐ（コーディングスタイルのイミュータブル原則）。
+> **注意:** `create_access_token` では `dict(data)` でコピーを作り、元の辞書を変更しないこと（イミュータブル原則）。
 
 ---
 
-### Step 1-3: バックエンド — モデル修正
+### Step 1-3: バックエンド — モデル確認
 
-**`backend/app/models.py` に `hashed_password` フィールドを確認**
+`backend/app/models.py` の `User` モデルに `hashed_password: str` フィールドが存在することを確認する。
 
-```python
-from __future__ import annotations
-from sqlmodel import Field, SQLModel
-
-
-class User(SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
-    username: str = Field(index=True, unique=True)
-    email: str = Field(index=True, unique=True)
-    hashed_password: str   # ← 平文パスワードは絶対に保存しない！
-```
+- 平文パスワードは絶対に保存してはいけない
+- `hashed_password` に `security.hash_password()` で生成した値を保存する
 
 ---
 
 ### Step 1-4: バックエンド — スキーマ追加
 
-**`backend/app/schemas/accounts.py` に追記：**
+**`backend/app/schemas/accounts.py` に以下の3つのクラスを追記する：**
 
-```python
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-
-
-class MeResponse(BaseModel):
-    id: int
-    username: str
-    email: str
-```
+- `LoginRequest` — ログインリクエスト用
+  - フィールド: `username: str`、`password: str`
+- `TokenResponse` — ログイン成功時のレスポンス用
+  - フィールド: `access_token: str`、`token_type: str`（デフォルト `"bearer"`）
+- `MeResponse` — 現在のユーザー情報レスポンス用
+  - フィールド: `id: int`、`username: str`、`email: str`
 
 ---
 
@@ -151,100 +98,34 @@ class MeResponse(BaseModel):
 
 **新規作成: `backend/app/deps.py`**
 
-```python
-from __future__ import annotations
+以下の内容を実装する。
 
-from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError
-from sqlmodel import Session, select
+- `OAuth2PasswordBearer` を使って `tokenUrl="/api/accounts/login/"` を指定する
+- `get_current_user(token, session)` 関数を実装する
+  - `Depends(oauth2_scheme)` でリクエストヘッダーからトークンを自動取得する
+  - `decode_token()` でトークンを検証し、ペイロードの `"sub"` からユーザー名を取得する
+  - ユーザー名が None またはトークンが不正な場合は `HTTP 401` を raise する
+  - DBからユーザーを検索し、存在しない場合も `HTTP 401` を raise する
+  - 正常な場合は `User` オブジェクトを返す
 
-from app.database import get_session
-from app.models import User
-from app.security import decode_token
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/accounts/login/")
-
-
-def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    session: Session = Depends(get_session),
-) -> User:
-    """
-    リクエストの Authorization ヘッダーからユーザーを取得する。
-    Depends() = FastAPIの依存性注入。「このデータを自動で用意して」という意味。
-    """
-    credentials_error = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="認証情報が無効です",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = decode_token(token)
-        username: str | None = payload.get("sub")
-        if username is None:
-            raise credentials_error
-    except JWTError:
-        raise credentials_error
-
-    user = session.exec(select(User).where(User.username == username)).first()
-    if user is None:
-        raise credentials_error
-    return user
-```
+> **ポイント:** `FastAPIの依存性注入 (Depends)` は「このデータを自動で用意して」という意味。エンドポイントの引数に書くだけで自動実行される。
 
 ---
 
 ### Step 1-6: バックエンド — ログインエンドポイント
 
-**`backend/app/api/accounts.py` に追記：**
+**`backend/app/api/accounts.py` に以下の2つのエンドポイントを追記する：**
 
-```python
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlmodel import Session, select
+**POST `/api/accounts/login/`**
+- `LoginRequest` を受け取る
+- DBからユーザー名でユーザーを検索する
+- ユーザーが存在しない、またはパスワードが不一致の場合は同じ `HTTP 401` を返す
+  - （ユーザーが存在しないかパスワードが違うかを区別するエラーメッセージは出さない — セキュリティ上の注意）
+- 認証成功時は `create_access_token({"sub": user.username})` でトークンを生成して `TokenResponse` を返す
 
-from app.database import get_session
-from app.deps import get_current_user
-from app.models import User
-from app.schemas.accounts import (
-    LoginRequest, MeResponse, RegisterRequest, RegisterResponse, TokenResponse
-)
-from app.security import create_access_token, hash_password, verify_password
-
-router = APIRouter(prefix="/accounts", tags=["accounts"])
-
-
-# 既存: POST /api/accounts/register/
-@router.post("/register/", response_model=RegisterResponse, status_code=201)
-def register(req: RegisterRequest, session: Session = Depends(get_session)):
-    # ... 既存の実装 ...
-
-
-# 新規: POST /api/accounts/login/
-@router.post("/login/", response_model=TokenResponse)
-def login(req: LoginRequest, session: Session = Depends(get_session)):
-    user = session.exec(select(User).where(User.username == req.username)).first()
-
-    # ユーザーが存在しない or パスワード不一致 → 同じエラーを返す（セキュリティ上の注意）
-    if not user or not verify_password(req.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="ユーザー名またはパスワードが違います",
-        )
-
-    token = create_access_token({"sub": user.username})
-    return TokenResponse(access_token=token)
-
-
-# 新規: GET /api/accounts/me/
-@router.get("/me/", response_model=MeResponse)
-def me(current_user: User = Depends(get_current_user)):
-    return MeResponse(
-        id=current_user.id,
-        username=current_user.username,
-        email=current_user.email,
-    )
-```
+**GET `/api/accounts/me/`**
+- `Depends(get_current_user)` で現在のユーザーを取得する
+- `MeResponse` に変換して返す
 
 ---
 
@@ -252,80 +133,18 @@ def me(current_user: User = Depends(get_current_user)):
 
 **新規作成: `backend/tests/test_login.py`**
 
-```python
-"""Phase 1: ログイン・JWT認証のテスト"""
-import pytest
-from fastapi.testclient import TestClient
+以下のテストケースをすべて実装する（TDDでテストを先に書く）：
 
+- `test_login_success` — 正しい認証情報でログインすると `access_token` と `token_type: "bearer"` が返る
+- `test_login_wrong_password` — パスワードが違うと HTTP 401 が返る
+- `test_login_unknown_user` — 存在しないユーザーは HTTP 401 が返る
+- `test_me_with_token` — 有効なトークンで `/me/` にアクセスすると自分の情報が返る
+- `test_me_without_token` — トークンなしで `/me/` にアクセスすると HTTP 401 が返る
 
-def test_login_success(client: TestClient, registered_user):
-    """正しい認証情報でログインするとトークンが返る"""
-    response = client.post("/api/accounts/login/", json={
-        "username": "testuser",
-        "password": "testpass123",
-    })
-    assert response.status_code == 200
-    data = response.json()
-    assert "access_token" in data
-    assert data["token_type"] == "bearer"
+**`backend/tests/conftest.py` に以下の fixture を追加する：**
 
-
-def test_login_wrong_password(client: TestClient, registered_user):
-    """パスワードが違うと 401 が返る"""
-    response = client.post("/api/accounts/login/", json={
-        "username": "testuser",
-        "password": "wrongpassword",
-    })
-    assert response.status_code == 401
-
-
-def test_login_unknown_user(client: TestClient):
-    """存在しないユーザーは 401 が返る"""
-    response = client.post("/api/accounts/login/", json={
-        "username": "nobody",
-        "password": "somepassword",
-    })
-    assert response.status_code == 401
-
-
-def test_me_with_token(client: TestClient, registered_user, auth_token):
-    """有効なトークンで /me/ にアクセスできる"""
-    response = client.get(
-        "/api/accounts/me/",
-        headers={"Authorization": f"Bearer {auth_token}"},
-    )
-    assert response.status_code == 200
-    assert response.json()["username"] == "testuser"
-
-
-def test_me_without_token(client: TestClient):
-    """トークンなしで /me/ にアクセスすると 401"""
-    response = client.get("/api/accounts/me/")
-    assert response.status_code == 401
-```
-
-**`backend/tests/conftest.py` に fixture を追加：**
-
-```python
-@pytest.fixture
-def registered_user(client: TestClient):
-    """テスト用ユーザーを事前に登録する"""
-    client.post("/api/accounts/register/", json={
-        "username": "testuser",
-        "email": "test@example.com",
-        "password": "testpass123",
-    })
-
-
-@pytest.fixture
-def auth_token(client: TestClient, registered_user):
-    """登録済みユーザーのJWTトークンを返す"""
-    response = client.post("/api/accounts/login/", json={
-        "username": "testuser",
-        "password": "testpass123",
-    })
-    return response.json()["access_token"]
-```
+- `registered_user` fixture — テスト用ユーザーをDBに登録する
+- `auth_token` fixture — `registered_user` を使ってログインし、`access_token` 文字列を返す
 
 ---
 
@@ -333,35 +152,13 @@ def auth_token(client: TestClient, registered_user):
 
 **新規作成: `frontend/src/api/auth.ts`**
 
-```typescript
-import apiClient from './client'
+以下のインターフェースと関数を実装する：
 
-export interface LoginRequest {
-  username: string
-  password: string
-}
-
-export interface TokenResponse {
-  access_token: string
-  token_type: string
-}
-
-export interface MeResponse {
-  id: number
-  username: string
-  email: string
-}
-
-export async function login(data: LoginRequest): Promise<TokenResponse> {
-  const response = await apiClient.post<TokenResponse>('/accounts/login/', data)
-  return response.data
-}
-
-export async function fetchMe(): Promise<MeResponse> {
-  const response = await apiClient.get<MeResponse>('/accounts/me/')
-  return response.data
-}
-```
+- インターフェース: `LoginRequest`（`username`, `password`）
+- インターフェース: `TokenResponse`（`access_token`, `token_type`）
+- インターフェース: `MeResponse`（`id`, `username`, `email`）
+- `login(data: LoginRequest): Promise<TokenResponse>` — `POST /accounts/login/` を呼ぶ
+- `fetchMe(): Promise<MeResponse>` — `GET /accounts/me/` を呼ぶ
 
 ---
 
@@ -369,44 +166,18 @@ export async function fetchMe(): Promise<MeResponse> {
 
 **新規作成: `frontend/src/api/token.ts`**
 
-```typescript
-const TOKEN_KEY = 'access_token'
+localStorage へのトークン操作を一箇所に集約する：
 
-export function saveToken(token: string): void {
-  localStorage.setItem(TOKEN_KEY, token)
-}
+- `TOKEN_KEY` 定数でキー名を管理する
+- `saveToken(token: string): void` — localStorage にトークンを保存する
+- `getToken(): string | null` — localStorage からトークンを取得する
+- `removeToken(): void` — localStorage からトークンを削除する
 
-export function getToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY)
-}
+**`frontend/src/api/client.ts` に Axios リクエストインターセプターを追加する：**
 
-export function removeToken(): void {
-  localStorage.removeItem(TOKEN_KEY)
-}
-```
-
-**`frontend/src/api/client.ts` を修正（自動でトークンをヘッダーに付ける）：**
-
-```typescript
-import axios from 'axios'
-import { getToken } from './token'
-
-const apiClient = axios.create({
-  baseURL: 'http://localhost:8000/api',
-  headers: { 'Content-Type': 'application/json' },
-})
-
-// リクエストインターセプター: 毎回自動でトークンを付ける
-apiClient.interceptors.request.use((config) => {
-  const token = getToken()
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`
-  }
-  return config
-})
-
-export default apiClient
-```
+- `apiClient.interceptors.request.use()` でリクエスト前処理を登録する
+- `getToken()` でトークンを取得し、存在すれば `Authorization: Bearer <token>` ヘッダーを自動付与する
+- トークンがない場合はヘッダーを付けない
 
 ---
 
@@ -414,102 +185,32 @@ export default apiClient
 
 **新規作成: `frontend/src/components/LoginForm.tsx`**
 
-```tsx
-import { useState } from 'react'
-import { login } from '../api/auth'
-import { saveToken } from '../api/token'
+以下の仕様で実装する：
 
-interface Props {
-  onSuccess: () => void
-}
-
-export default function LoginForm({ onSuccess }: Props) {
-  const [username, setUsername] = useState('')
-  const [password, setPassword] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
-
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault()
-    setError(null)
-    setLoading(true)
-    try {
-      const token = await login({ username, password })
-      saveToken(token.access_token)
-      onSuccess()
-    } catch {
-      setError('ユーザー名またはパスワードが違います')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  return (
-    <form onSubmit={handleSubmit}>
-      <h2>ログイン</h2>
-      {error && <p style={{ color: 'red' }}>{error}</p>}
-      <div>
-        <label>ユーザー名</label>
-        <input value={username} onChange={e => setUsername(e.target.value)} required />
-      </div>
-      <div>
-        <label>パスワード</label>
-        <input type="password" value={password} onChange={e => setPassword(e.target.value)} required />
-      </div>
-      <button type="submit" disabled={loading}>
-        {loading ? 'ログイン中...' : 'ログイン'}
-      </button>
-    </form>
-  )
-}
-```
+- Props: `onSuccess: () => void`（ログイン成功後に呼ぶコールバック）
+- state: `username`、`password`、`error`（文字列 or null）、`loading`（boolean）
+- フォーム送信時: `login()` を呼び、成功時は `saveToken()` してから `onSuccess()` を実行
+- エラー時は `error` state にメッセージを設定して表示する
+- ローディング中はボタンを `disabled` にする
 
 **新規作成: `frontend/src/pages/LoginPage.tsx`**
 
-```tsx
-import { useNavigate } from 'react-router-dom'
-import LoginForm from '../components/LoginForm'
-
-export default function LoginPage() {
-  const navigate = useNavigate()
-  return <LoginForm onSuccess={() => navigate('/tasks')} />
-}
-```
+- `LoginForm` をレンダリングする
+- `onSuccess` コールバックで `/tasks` へ遷移する
 
 ---
 
 ### Step 1-11: フロントエンド — React Router 導入
 
-```bash
-cd frontend
-npm install react-router-dom
-```
+`npm install react-router-dom` でパッケージを追加する。
 
-**`frontend/src/App.tsx` を修正：**
+**`frontend/src/App.tsx` を以下の仕様で書き換える：**
 
-```tsx
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import { getToken } from './api/token'
-import LoginPage from './pages/LoginPage'
-import RegisterPage from './pages/RegisterPage'
-
-function PrivateRoute({ children }: { children: React.ReactNode }) {
-  return getToken() ? <>{children}</> : <Navigate to="/login" replace />
-}
-
-export default function App() {
-  return (
-    <BrowserRouter>
-      <Routes>
-        <Route path="/register" element={<RegisterPage />} />
-        <Route path="/login" element={<LoginPage />} />
-        {/* Phase 2 以降に追加: <Route path="/tasks" element={<PrivateRoute><TasksPage /></PrivateRoute>} /> */}
-        <Route path="*" element={<Navigate to="/login" replace />} />
-      </Routes>
-    </BrowserRouter>
-  )
-}
-```
+- `BrowserRouter` でアプリ全体をラップする
+- `/register` → `RegisterPage`
+- `/login` → `LoginPage`
+- それ以外のパス → `/login` へリダイレクト
+- `PrivateRoute` コンポーネントを作る — `getToken()` がある場合は children をレンダリングし、なければ `/login` へリダイレクトする（Phase 2 以降で `/tasks` に使う）
 
 ---
 
@@ -541,29 +242,14 @@ export default function App() {
 
 ### Step 2-1: バックエンド — Task モデル
 
-**`backend/app/models.py` に追記：**
+**`backend/app/models.py` に `Task` クラスを追記する：**
 
-```python
-from __future__ import annotations
-from datetime import datetime, timezone
-from sqlmodel import Field, SQLModel
-
-
-class User(SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
-    username: str = Field(index=True, unique=True)
-    email: str = Field(index=True, unique=True)
-    hashed_password: str
-
-
-class Task(SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
-    title: str = Field(min_length=1, max_length=200)
-    description: str = Field(default="")
-    completed: bool = Field(default=False)
-    owner_id: int = Field(foreign_key="user.id")  # User テーブルを参照
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-```
+- `id: int | None` — プライマリキー、デフォルト None
+- `title: str` — 最小長 1、最大長 200
+- `description: str` — デフォルト空文字
+- `completed: bool` — デフォルト False
+- `owner_id: int` — `foreign_key="user.id"` で User テーブルを参照する
+- `created_at: datetime` — `default_factory` でUTC現在時刻を設定する
 
 > **foreign_key とは？**
 > 「このフィールドは別のテーブルの ID を参照する」という意味。
@@ -575,40 +261,15 @@ class Task(SQLModel, table=True):
 
 **新規作成: `backend/app/schemas/tasks.py`**
 
-```python
-from datetime import datetime
-from pydantic import BaseModel, field_validator
+以下の3つのクラスを実装する：
 
-
-class TaskCreate(BaseModel):
-    title: str
-    description: str = ""
-
-    @field_validator("title")
-    @classmethod
-    def title_not_empty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("タイトルは必須です")
-        if len(v) > 200:
-            raise ValueError("タイトルは200文字以内にしてください")
-        return v
-
-
-class TaskUpdate(BaseModel):
-    title: str | None = None
-    description: str | None = None
-    completed: bool | None = None
-
-
-class TaskResponse(BaseModel):
-    id: int
-    title: str
-    description: str
-    completed: bool
-    owner_id: int
-    created_at: datetime
-```
+- `TaskCreate` — タスク作成リクエスト用
+  - フィールド: `title: str`、`description: str`（デフォルト空文字）
+  - `field_validator` で `title` の前後空白を除去し、空文字なら ValueError、200文字超なら ValueError を raise する
+- `TaskUpdate` — タスク更新リクエスト用（すべて Optional）
+  - フィールド: `title: str | None`、`description: str | None`、`completed: bool | None`
+- `TaskResponse` — タスクレスポンス用
+  - フィールド: `id`、`title`、`description`、`completed`、`owner_id`、`created_at`
 
 ---
 
@@ -616,105 +277,30 @@ class TaskResponse(BaseModel):
 
 **新規作成: `backend/app/api/tasks.py`**
 
-```python
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlmodel import Session, select
+すべてのエンドポイントで `Depends(get_current_user)` を使い、ログインユーザーのみアクセス可能にする。
 
-from app.database import get_session
-from app.deps import get_current_user
-from app.models import Task, User
-from app.schemas.tasks import TaskCreate, TaskResponse, TaskUpdate
-
-router = APIRouter(prefix="/tasks", tags=["tasks"])
-
-
-@router.post("/", response_model=TaskResponse, status_code=201)
-def create_task(
-    req: TaskCreate,
-    session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
-):
-    task = Task(
-        title=req.title,
-        description=req.description,
-        owner_id=current_user.id,
-    )
-    session.add(task)
-    session.commit()
-    session.refresh(task)
-    return task
-
-
-@router.get("/", response_model=list[TaskResponse])
-def list_tasks(
-    session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
-):
-    tasks = session.exec(
-        select(Task).where(Task.owner_id == current_user.id)
-    ).all()
-    return tasks
-
-
-@router.get("/{task_id}/", response_model=TaskResponse)
-def get_task(
-    task_id: int,
-    session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
-):
-    task = session.get(Task, task_id)
-    if not task or task.owner_id != current_user.id:
-        raise HTTPException(status_code=404, detail="タスクが見つかりません")
-    return task
-
-
-@router.patch("/{task_id}/", response_model=TaskResponse)
-def update_task(
-    task_id: int,
-    req: TaskUpdate,
-    session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
-):
-    task = session.get(Task, task_id)
-    if not task or task.owner_id != current_user.id:
-        raise HTTPException(status_code=404, detail="タスクが見つかりません")
-
-    # None でないフィールドだけ更新
-    update_data = req.model_dump(exclude_none=True)
-    for key, value in update_data.items():
-        setattr(task, key, value)
-
-    session.add(task)
-    session.commit()
-    session.refresh(task)
-    return task
-
-
-@router.delete("/{task_id}/", status_code=204)
-def delete_task(
-    task_id: int,
-    session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
-):
-    task = session.get(Task, task_id)
-    if not task or task.owner_id != current_user.id:
-        raise HTTPException(status_code=404, detail="タスクが見つかりません")
-    session.delete(task)
-    session.commit()
-```
+- **POST `/api/tasks/`** — タスク作成
+  - `TaskCreate` を受け取り、`owner_id = current_user.id` をセットして DB に保存する
+  - ステータスコード 201 で `TaskResponse` を返す
+- **GET `/api/tasks/`** — タスク一覧取得
+  - `owner_id == current_user.id` の条件でフィルタリングして返す
+- **GET `/api/tasks/{task_id}/`** — タスク単体取得
+  - タスクが存在しない、または `owner_id != current_user.id` の場合は HTTP 404 を返す
+- **PATCH `/api/tasks/{task_id}/`** — タスク更新
+  - `TaskUpdate` を受け取り、`model_dump(exclude_none=True)` で None 以外のフィールドのみ更新する
+  - 所有者チェックを行う（404）
+- **DELETE `/api/tasks/{task_id}/`** — タスク削除
+  - 所有者チェックを行う（404）
+  - ステータスコード 204 を返す
 
 ---
 
 ### Step 2-4: バックエンド — ルーター登録
 
-**`backend/app/main.py` に追記：**
+**`backend/app/main.py` を修正する：**
 
-```python
-from app.api import accounts, tasks   # tasks を追加
-
-app.include_router(accounts.router, prefix="/api")
-app.include_router(tasks.router, prefix="/api")    # ← 追加
-```
+- `from app.api import accounts, tasks` に変更する
+- `app.include_router(tasks.router, prefix="/api")` を追加する
 
 ---
 
@@ -722,83 +308,15 @@ app.include_router(tasks.router, prefix="/api")    # ← 追加
 
 **新規作成: `backend/tests/test_tasks.py`**
 
-```python
-"""Phase 2: タスク CRUD のテスト"""
-import pytest
-from fastapi.testclient import TestClient
+以下のテストケースをすべて実装する（TDDでテストを先に書く）：
 
-
-@pytest.fixture
-def auth_headers(client: TestClient):
-    """認証済みヘッダーを返す"""
-    client.post("/api/accounts/register/", json={
-        "username": "taskuser", "email": "task@example.com", "password": "password123"
-    })
-    response = client.post("/api/accounts/login/", json={
-        "username": "taskuser", "password": "password123"
-    })
-    token = response.json()["access_token"]
-    return {"Authorization": f"Bearer {token}"}
-
-
-def test_create_task(client: TestClient, auth_headers):
-    response = client.post("/api/tasks/", json={"title": "買い物"}, headers=auth_headers)
-    assert response.status_code == 201
-    assert response.json()["title"] == "買い物"
-    assert response.json()["completed"] is False
-
-
-def test_list_tasks(client: TestClient, auth_headers):
-    client.post("/api/tasks/", json={"title": "タスク1"}, headers=auth_headers)
-    client.post("/api/tasks/", json={"title": "タスク2"}, headers=auth_headers)
-    response = client.get("/api/tasks/", headers=auth_headers)
-    assert response.status_code == 200
-    assert len(response.json()) == 2
-
-
-def test_update_task(client: TestClient, auth_headers):
-    created = client.post("/api/tasks/", json={"title": "元のタイトル"}, headers=auth_headers)
-    task_id = created.json()["id"]
-    response = client.patch(
-        f"/api/tasks/{task_id}/",
-        json={"completed": True},
-        headers=auth_headers,
-    )
-    assert response.status_code == 200
-    assert response.json()["completed"] is True
-
-
-def test_delete_task(client: TestClient, auth_headers):
-    created = client.post("/api/tasks/", json={"title": "削除するタスク"}, headers=auth_headers)
-    task_id = created.json()["id"]
-    client.delete(f"/api/tasks/{task_id}/", headers=auth_headers)
-    response = client.get(f"/api/tasks/{task_id}/", headers=auth_headers)
-    assert response.status_code == 404
-
-
-def test_cannot_access_other_users_task(client: TestClient, auth_headers):
-    """他のユーザーのタスクは見えない"""
-    # 別ユーザーを作ってタスクを作る
-    client.post("/api/accounts/register/", json={
-        "username": "other", "email": "other@example.com", "password": "password123"
-    })
-    other_login = client.post("/api/accounts/login/", json={
-        "username": "other", "password": "password123"
-    })
-    other_headers = {"Authorization": f"Bearer {other_login.json()['access_token']}"}
-    created = client.post("/api/tasks/", json={"title": "他人のタスク"}, headers=other_headers)
-    task_id = created.json()["id"]
-
-    # 最初のユーザーからアクセス → 404
-    response = client.get(f"/api/tasks/{task_id}/", headers=auth_headers)
-    assert response.status_code == 404
-
-
-def test_create_task_without_auth(client: TestClient):
-    """未認証でタスク作成 → 401"""
-    response = client.post("/api/tasks/", json={"title": "テスト"})
-    assert response.status_code == 401
-```
+- `auth_headers` fixture — テスト用ユーザーを登録・ログインし、`{"Authorization": "Bearer <token>"}` の dict を返す
+- `test_create_task` — タスクを作成すると `title` が一致し `completed=False` で返る（201）
+- `test_list_tasks` — 2件作成後に一覧取得すると2件返る（200）
+- `test_update_task` — `completed: true` で PATCH すると `completed` が更新される（200）
+- `test_delete_task` — 削除後に GET すると 404 が返る
+- `test_cannot_access_other_users_task` — 別ユーザーのタスクに GET すると 404 が返る
+- `test_create_task_without_auth` — 未認証で POST すると 401 が返る
 
 ---
 
@@ -806,48 +324,15 @@ def test_create_task_without_auth(client: TestClient):
 
 **新規作成: `frontend/src/api/tasks.ts`**
 
-```typescript
-import apiClient from './client'
+以下のインターフェースと関数を実装する：
 
-export interface Task {
-  id: number
-  title: string
-  description: string
-  completed: boolean
-  owner_id: number
-  created_at: string
-}
-
-export interface TaskCreate {
-  title: string
-  description?: string
-}
-
-export interface TaskUpdate {
-  title?: string
-  description?: string
-  completed?: boolean
-}
-
-export async function fetchTasks(): Promise<Task[]> {
-  const res = await apiClient.get<Task[]>('/tasks/')
-  return res.data
-}
-
-export async function createTask(data: TaskCreate): Promise<Task> {
-  const res = await apiClient.post<Task>('/tasks/', data)
-  return res.data
-}
-
-export async function updateTask(id: number, data: TaskUpdate): Promise<Task> {
-  const res = await apiClient.patch<Task>(`/tasks/${id}/`, data)
-  return res.data
-}
-
-export async function deleteTask(id: number): Promise<void> {
-  await apiClient.delete(`/tasks/${id}/`)
-}
-```
+- インターフェース: `Task`（`id`, `title`, `description`, `completed`, `owner_id`, `created_at`）
+- インターフェース: `TaskCreate`（`title`, `description?`）
+- インターフェース: `TaskUpdate`（`title?`, `description?`, `completed?`）
+- `fetchTasks(): Promise<Task[]>` — `GET /tasks/` を呼ぶ
+- `createTask(data: TaskCreate): Promise<Task>` — `POST /tasks/` を呼ぶ
+- `updateTask(id: number, data: TaskUpdate): Promise<Task>` — `PATCH /tasks/{id}/` を呼ぶ
+- `deleteTask(id: number): Promise<void>` — `DELETE /tasks/{id}/` を呼ぶ
 
 ---
 
@@ -855,95 +340,20 @@ export async function deleteTask(id: number): Promise<void> {
 
 **新規作成: `frontend/src/pages/TasksPage.tsx`**
 
-```tsx
-import { useEffect, useState } from 'react'
-import { fetchTasks, createTask, updateTask, deleteTask, Task } from '../api/tasks'
-import { removeToken } from '../api/token'
-import { useNavigate } from 'react-router-dom'
+以下の仕様で実装する：
 
-export default function TasksPage() {
-  const [tasks, setTasks] = useState<Task[]>([])
-  const [newTitle, setNewTitle] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const navigate = useNavigate()
+- state: `tasks: Task[]`、`newTitle: string`、`error: string | null`
+- `useEffect` でページ表示時に `fetchTasks()` を呼び、取得したタスクを state にセットする
+- フォーム送信で `createTask()` を呼び、成功したら **新しい配列** を作って state を更新する（`setTasks(prev => [...prev, created])`）
+- チェックボックスクリックで `updateTask()` を呼び、成功したら `prev.map()` で対象タスクだけ置き換える
+- 削除ボタンクリックで `deleteTask()` を呼び、成功したら `prev.filter()` で対象タスクを除外する
+- ログアウトボタンで `removeToken()` を呼び、`/login` へ遷移する
+- エラー発生時は `error` state にメッセージをセットして表示する
 
-  // ページ表示時にタスク一覧を取得
-  useEffect(() => {
-    fetchTasks()
-      .then(setTasks)
-      .catch(() => setError('タスクの取得に失敗しました'))
-  }, [])
+**`frontend/src/App.tsx` を修正する：**
 
-  async function handleCreate(e: React.FormEvent) {
-    e.preventDefault()
-    if (!newTitle.trim()) return
-    try {
-      const created = await createTask({ title: newTitle })
-      setTasks(prev => [...prev, created])  // 新しい配列を作る（イミュータブル）
-      setNewTitle('')
-    } catch {
-      setError('タスクの作成に失敗しました')
-    }
-  }
-
-  async function handleToggle(task: Task) {
-    try {
-      const updated = await updateTask(task.id, { completed: !task.completed })
-      setTasks(prev => prev.map(t => t.id === updated.id ? updated : t))
-    } catch {
-      setError('更新に失敗しました')
-    }
-  }
-
-  async function handleDelete(id: number) {
-    try {
-      await deleteTask(id)
-      setTasks(prev => prev.filter(t => t.id !== id))
-    } catch {
-      setError('削除に失敗しました')
-    }
-  }
-
-  function handleLogout() {
-    removeToken()
-    navigate('/login')
-  }
-
-  return (
-    <div>
-      <h1>タスク一覧</h1>
-      <button onClick={handleLogout}>ログアウト</button>
-
-      {error && <p style={{ color: 'red' }}>{error}</p>}
-
-      <form onSubmit={handleCreate}>
-        <input
-          value={newTitle}
-          onChange={e => setNewTitle(e.target.value)}
-          placeholder="新しいタスクを入力"
-        />
-        <button type="submit">追加</button>
-      </form>
-
-      <ul>
-        {tasks.map(task => (
-          <li key={task.id}>
-            <input
-              type="checkbox"
-              checked={task.completed}
-              onChange={() => handleToggle(task)}
-            />
-            <span style={{ textDecoration: task.completed ? 'line-through' : 'none' }}>
-              {task.title}
-            </span>
-            <button onClick={() => handleDelete(task.id)}>削除</button>
-          </li>
-        ))}
-      </ul>
-    </div>
-  )
-}
-```
+- `TasksPage` をインポートして `/tasks` ルートを追加する
+- `/tasks` は `PrivateRoute` でラップする（未ログイン時は `/login` へリダイレクト）
 
 ---
 
@@ -962,44 +372,30 @@ export default function TasksPage() {
 
 ### Step 3-1: フィルタリング機能
 
-**`frontend/src/pages/TasksPage.tsx` にフィルター追加：**
+**`frontend/src/pages/TasksPage.tsx` にフィルター機能を追加する：**
 
-```tsx
-type Filter = 'all' | 'active' | 'completed'
-
-// コンポーネント内に追加
-const [filter, setFilter] = useState<Filter>('all')
-
-const filteredTasks = tasks.filter(task => {
-  if (filter === 'active') return !task.completed
-  if (filter === 'completed') return task.completed
-  return true
-})
-
-// JSX にフィルターボタンを追加
-<div>
-  <button onClick={() => setFilter('all')}>すべて</button>
-  <button onClick={() => setFilter('active')}>未完了</button>
-  <button onClick={() => setFilter('completed')}>完了済み</button>
-</div>
-
-// tasks.map → filteredTasks.map に変更
-```
+- `Filter` 型を定義する（`'all' | 'active' | 'completed'`）
+- `filter: Filter` の state を追加し、デフォルトは `'all'`
+- `filteredTasks` を `tasks.filter()` で導出する変数として定義する
+  - `'active'` のとき: `completed === false` のタスクのみ
+  - `'completed'` のとき: `completed === true` のタスクのみ
+  - `'all'` のとき: すべてのタスク
+- 「すべて」「未完了」「完了済み」の3つのボタンを追加し、クリックで `filter` state を更新する
+- `tasks.map()` を `filteredTasks.map()` に変更する
 
 ---
 
 ### Step 3-2: ソート機能
 
-```tsx
-type SortKey = 'created_at' | 'title'
+**`frontend/src/pages/TasksPage.tsx` にソート機能を追加する：**
 
-const [sortKey, setSortKey] = useState<SortKey>('created_at')
-
-const sortedTasks = [...filteredTasks].sort((a, b) => {
-  if (sortKey === 'title') return a.title.localeCompare(b.title)
-  return new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-})
-```
+- `SortKey` 型を定義する（`'created_at' | 'title'`）
+- `sortKey: SortKey` の state を追加し、デフォルトは `'created_at'`
+- `sortedTasks` を `filteredTasks` をスプレッドしてから `sort()` した変数として定義する
+  - `title` ソート時: `localeCompare` で日本語対応のアルファベット順
+  - `created_at` ソート時: `Date` に変換して時系列順
+- 「作成日順」「タイトル順」のボタンを追加し、クリックで `sortKey` state を更新する
+- `filteredTasks.map()` を `sortedTasks.map()` に変更する
 
 ---
 
@@ -1017,39 +413,30 @@ const sortedTasks = [...filteredTasks].sort((a, b) => {
 
 ### Step 4-1: バックエンド カバレッジ確認
 
-```bash
-pip install pytest-cov
-pytest --cov=app --cov-report=html
-# htmlcov/index.html をブラウザで開いて確認
-```
+`requirements.txt` に `pytest-cov` を追加してインストールし、`pytest --cov=app --cov-report=html` を実行する。
+
+生成された `htmlcov/index.html` をブラウザで開き、80%以上のカバレッジを確認する。
 
 ### Step 4-2: フロントエンド カバレッジ確認
 
-```bash
-npm run test:coverage
-# coverage/index.html をブラウザで確認
-```
+`npm run test:coverage` を実行する。
+
+生成された `coverage/index.html` をブラウザで確認し、80%以上のカバレッジを確認する。
 
 ### Step 4-3: Docker Compose
 
 **新規作成: `docker-compose.yml`**（ルートディレクトリ）
 
-```yaml
-services:
-  backend:
-    build: ./backend
-    ports:
-      - "8000:8000"
-    environment:
-      - SECRET_KEY=change-this-in-production
+以下の2つのサービスを定義する：
 
-  frontend:
-    build: ./frontend
-    ports:
-      - "5173:80"
-    depends_on:
-      - backend
-```
+- `backend` サービス
+  - `./backend` を build context とする
+  - ポート `8000:8000` を公開する
+  - 環境変数 `SECRET_KEY` を設定する（本番値に変更すること）
+- `frontend` サービス
+  - `./frontend` を build context とする
+  - ポート `5173:80` を公開する
+  - `depends_on: backend` を設定する
 
 ---
 
